@@ -543,8 +543,10 @@ async function tryAutoFill(schema: ReturnType<typeof extractFormSchema>): Promis
           console.log(`[AI Fallback] Hydrated field "${f.label || f.selector}":`, opts?.length ?? 0, 'options:', opts ?? []);
         }
 
-        // Only run AI fallback on the hydrated fields (not the full schema)
-        const fallbackResult = await applyAIOptionFallback(hydratedSchema, mappings, profile);
+        // Only run AI fallback on the hydrated fields (not the full schema).
+        // Pass empty existingMappings so already_filled logic doesn't skip fields
+        // that were attempted but not correctly filled during the main pass.
+        const fallbackResult = await applyAIOptionFallback(hydratedSchema, [], profile);
         info('[AI Fallback] Summary:', fallbackResult.diagnostics);
 
         // Log every mapping the AI fallback produced
@@ -2269,46 +2271,119 @@ async function hydrateOptionsForFallback(
 
   for (const field of candidates) {
     const el = document.querySelector(field.selector) as HTMLElement | null;
-    if (!el) continue;
-
-    try {
-      el.scrollIntoView({ block: 'center', behavior: 'auto' });
-      (el as any).focus?.();
-      el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
-      el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-      el.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));
-    } catch {
-      // non-fatal; continue with best effort
+    if (!el) {
+      console.warn(`[AI Fallback] Element not found for selector: ${field.selector}`);
+      continue;
     }
+
+    console.log(`[AI Fallback] Hydrating "${field.label || field.selector}" — element:`, el.tagName, el.getAttribute('role'), el.className.slice(0, 80));
+
+    // ── Scrape options from the open listbox ─────────────────────────────────
+    // React Select portals the menu to body. The listbox id follows the pattern
+    // "react-select-{id}-listbox" or is referenced via aria-controls on the input.
+    const scrapeOpenOptions = (anchor: HTMLElement): string[] => {
+      const inputEl = anchor instanceof HTMLInputElement
+        ? anchor
+        : anchor.querySelector<HTMLInputElement>('input[role="combobox"], input');
+
+      let listbox: Element | null = null;
+
+      // 1. aria-controls on the input (standard)
+      if (inputEl) {
+        const controlsId = inputEl.getAttribute('aria-controls') || inputEl.getAttribute('aria-owns');
+        if (controlsId) listbox = document.getElementById(controlsId);
+
+        // 2. React Select naming convention: react-select-{inputId}-listbox
+        if (!listbox && inputEl.id) {
+          listbox = document.getElementById(`react-select-${inputEl.id}-listbox`);
+        }
+      }
+
+      // 3. Any visible portaled menu near the anchor
+      if (!listbox) {
+        const anchorRect = anchor.getBoundingClientRect();
+        for (const sel of ['[class*="select__menu"]', '[role="listbox"]']) {
+          for (const menu of document.querySelectorAll<HTMLElement>(sel)) {
+            const cls = menu.className || '';
+            if (cls.includes('iti__') || cls.includes('country')) continue;
+            const rect = menu.getBoundingClientRect();
+            if (rect.height > 0 && rect.width > 0 && Math.abs(rect.top - anchorRect.bottom) < 600) {
+              listbox = menu;
+              break;
+            }
+          }
+          if (listbox) break;
+        }
+      }
+
+      console.log(`[AI Fallback] Listbox found:`, listbox?.id || listbox?.className?.slice(0, 60) || 'none');
+
+      const root = listbox ?? document;
+      const optionEls = root.querySelectorAll<HTMLElement>('[role="option"], [class*="select__option"]');
+
+      const results: string[] = [];
+      for (const opt of optionEls) {
+        const text = (opt.textContent || '').trim();
+        const lower = text.toLowerCase();
+        if (!text || text.length > 150) continue;
+        if (lower === 'no options' || lower === 'select...' || lower === 'select') continue;
+        if (/^options?\s*:/i.test(text)) continue;
+        const cls = opt.className || '';
+        if (cls.includes('iti__') || cls.includes('country')) continue;
+        results.push(text);
+      }
+      return results;
+    };
+
+    // ── Open the dropdown ─────────────────────────────────────────────────────
+    // The selector points to the combobox input (e.g. input#29274).
+    // React Select opens when mousedown fires on the control div, then ArrowDown
+    // on the input forces it to render options.
+    const comboInput = el instanceof HTMLInputElement
+      ? el
+      : el.querySelector<HTMLInputElement>('input[role="combobox"]') ?? el.querySelector<HTMLInputElement>('input');
+
+    const controlDiv = (comboInput ?? el).closest<HTMLElement>('[class*="select__control"], [class*="control"]') ?? el;
+
+    console.log(`[AI Fallback] controlDiv:`, controlDiv.tagName, controlDiv.className.slice(0, 80));
+    console.log(`[AI Fallback] comboInput id:`, comboInput?.id, 'aria-expanded:', comboInput?.getAttribute('aria-expanded'));
+
+    controlDiv.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    await new Promise(resolve => setTimeout(resolve, 300));
+
+    controlDiv.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+    controlDiv.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+    controlDiv.click();
+
+    if (comboInput) {
+      comboInput.focus();
+      comboInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', code: 'ArrowDown', keyCode: 40, bubbles: true, cancelable: true }));
+    }
+
     await new Promise(resolve => setTimeout(resolve, 400));
+    console.log(`[AI Fallback] aria-expanded after open:`, comboInput?.getAttribute('aria-expanded'));
 
-    // Scrape visible listbox options directly from the DOM while the dropdown is open.
-    // React/custom dropdowns render [role="option"] elements in a listbox that
-    // extractFormSchema never captures — so we grab them here.
-    const optionEls = document.querySelectorAll<HTMLElement>(
-      '[role="option"], [role="listbox"] li, [class*="select__option"], [class*="option-item"], [class*="dropdown-item"]'
-    );
-    const options: string[] = [];
-    for (const opt of optionEls) {
-      const text = opt.textContent?.trim() || '';
-      const lower = text.toLowerCase();
-      if (!text || text.length > 120) continue;
-      if (lower === 'no options' || lower === 'select...' || lower === 'select') continue;
-      // Exclude phone country code items
-      const cls = opt.className || '';
-      if (cls.includes('iti__') || cls.includes('country')) continue;
-      options.push(text);
+    // Poll for options to appear (up to 10 × 300ms = 3s)
+    let options: string[] = [];
+    for (let attempt = 0; attempt < 10; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 300));
+      options = scrapeOpenOptions(comboInput ?? el);
+      if (options.length > 0) {
+        console.log(`[AI Fallback] Hydrated ${options.length} options for "${field.label || field.selector}" after ${(attempt + 1) * 300}ms:`, options);
+        break;
+      }
     }
 
-    if (options.length > 0) {
-      console.log(`[AI Fallback] Hydrated ${options.length} options for "${field.label || field.selector}":`, options.slice(0, 5));
+    if (options.length === 0) {
+      console.warn(`[AI Fallback] No options scraped for "${field.label || field.selector}" — dropdown may not have opened`);
+    } else {
       scrapedOptions.set(field.selector, options);
     }
 
     // Close the dropdown before moving to the next field
-    el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
-    el.blur();
-    await new Promise(resolve => setTimeout(resolve, 150));
+    document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    document.body.click();
+    await new Promise(resolve => setTimeout(resolve, 300));
   }
 
   // Also do a DOM re-scan to pick up any native <select> options that appeared
