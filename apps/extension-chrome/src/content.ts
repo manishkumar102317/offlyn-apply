@@ -508,18 +508,6 @@ async function tryAutoFill(schema: ReturnType<typeof extractFormSchema>): Promis
       warn('[Graph] Enhancement failed, continuing with profile mappings:', err);
     }
 
-    // AI fallback for unresolved option-like fields:
-    // 1) hydrate dynamic dropdown options, 2) send question + options + full profile,
-    // 3) accept only exact option matches.
-    try {
-      const hydratedSchema = await hydrateOptionsForFallback(schema, mappings);
-      const fallbackResult = await applyAIOptionFallback(hydratedSchema, mappings, profile);
-      mappings = fallbackResult.mappings;
-      info('[AI Fallback] Summary:', fallbackResult.diagnostics);
-    } catch (err) {
-      warn('[AI Fallback] Failed, continuing with existing mappings:', err);
-    }
-
     if (mappings.length === 0) {
       info('ℹ️ No fields matched profile data.');
       showNotification('No matches found', 'No fields could be auto-filled from your profile.', 'info');
@@ -538,7 +526,49 @@ async function tryAutoFill(schema: ReturnType<typeof extractFormSchema>): Promis
     };
     
     // Execute immediately (settings will be checked in executeFillPlan)
-    await executeFillPlan(fillPlan);
+    const fillResult = await executeFillPlan(fillPlan);
+
+    // Post-fill hydration: for any option-like fields that had no options available
+    // during filling (React hadn't rendered them yet), now hydrate and re-fill them.
+    if (fillResult.noOptionSelectors.length > 0) {
+      info(`[AI Fallback] Post-fill hydration for ${fillResult.noOptionSelectors.length} unresolved dropdown(s)`);
+      try {
+        const noOptionSet = new Set(fillResult.noOptionSelectors);
+        const schemaToHydrate = schema.filter(f => noOptionSet.has(f.selector));
+        const hydratedSchema = await hydrateOptionsForFallback(schemaToHydrate, []);
+
+        // Log hydrated options per field
+        for (const f of hydratedSchema) {
+          const opts = (f as any).options as string[] | undefined;
+          console.log(`[AI Fallback] Hydrated field "${f.label || f.selector}":`, opts?.length ?? 0, 'options:', opts ?? []);
+        }
+
+        // Only run AI fallback on the hydrated fields (not the full schema)
+        const fallbackResult = await applyAIOptionFallback(hydratedSchema, mappings, profile);
+        info('[AI Fallback] Summary:', fallbackResult.diagnostics);
+
+        // Log every mapping the AI fallback produced
+        console.log('[AI Fallback] All fallback mappings:', fallbackResult.mappings.map(m => ({
+          selector: m.selector,
+          value: m.value,
+          label: hydratedSchema.find(f => f.selector === m.selector)?.label ?? '',
+        })));
+
+        // Re-fill only the newly resolved fields
+        const newMappings = fallbackResult.mappings.filter(m => noOptionSet.has(m.selector));
+        console.log('[AI Fallback] Mappings queued for re-fill:', newMappings.map(m => ({ selector: m.selector, value: m.value })));
+        if (newMappings.length > 0) {
+          await executeFillPlan({
+            kind: 'FILL_PLAN',
+            requestId: `autofill_fallback_${Date.now()}`,
+            mappings: newMappings,
+            dryRun: false,
+          });
+        }
+      } catch (err) {
+        warn('[AI Fallback] Post-fill hydration failed:', err);
+      }
+    }
 
     // Workday-specific: handle "Add" modal sections (Work Experience, Education,
     // Languages) and the Skills tag-input that the generic engine cannot reach.
@@ -2234,6 +2264,9 @@ async function hydrateOptionsForFallback(
 
   info(`[AI Fallback] Hydration pass for ${candidates.length} unresolved option-like field(s)`);
 
+  // Map to collect scraped options per selector
+  const scrapedOptions = new Map<string, string[]>();
+
   for (const field of candidates) {
     const el = document.querySelector(field.selector) as HTMLElement | null;
     if (!el) continue;
@@ -2247,9 +2280,38 @@ async function hydrateOptionsForFallback(
     } catch {
       // non-fatal; continue with best effort
     }
-    await new Promise(resolve => setTimeout(resolve, 220));
+    await new Promise(resolve => setTimeout(resolve, 400));
+
+    // Scrape visible listbox options directly from the DOM while the dropdown is open.
+    // React/custom dropdowns render [role="option"] elements in a listbox that
+    // extractFormSchema never captures — so we grab them here.
+    const optionEls = document.querySelectorAll<HTMLElement>(
+      '[role="option"], [role="listbox"] li, [class*="select__option"], [class*="option-item"], [class*="dropdown-item"]'
+    );
+    const options: string[] = [];
+    for (const opt of optionEls) {
+      const text = opt.textContent?.trim() || '';
+      const lower = text.toLowerCase();
+      if (!text || text.length > 120) continue;
+      if (lower === 'no options' || lower === 'select...' || lower === 'select') continue;
+      // Exclude phone country code items
+      const cls = opt.className || '';
+      if (cls.includes('iti__') || cls.includes('country')) continue;
+      options.push(text);
+    }
+
+    if (options.length > 0) {
+      console.log(`[AI Fallback] Hydrated ${options.length} options for "${field.label || field.selector}":`, options.slice(0, 5));
+      scrapedOptions.set(field.selector, options);
+    }
+
+    // Close the dropdown before moving to the next field
+    el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    el.blur();
+    await new Promise(resolve => setTimeout(resolve, 150));
   }
 
+  // Also do a DOM re-scan to pick up any native <select> options that appeared
   let refreshed: FieldSchema[] = [];
   try {
     const forms = document.querySelectorAll<HTMLFormElement>('form');
@@ -2262,21 +2324,30 @@ async function hydrateOptionsForFallback(
     }
   } catch (err) {
     warn('[AI Fallback] Option hydration re-scan failed:', err);
-    return schema;
   }
 
   const refreshedBySelector = new Map(refreshed.map(f => [f.selector, f]));
   const merged = schema.map(field => {
-    const updated = refreshedBySelector.get(field.selector);
-    if (!updated) return field;
     const mergedField = { ...field } as any;
 
-    if (Array.isArray((updated as any).options) && (updated as any).options.length > 0) {
-      mergedField.options = (updated as any).options;
+    // Prefer directly scraped listbox options (React dropdowns)
+    const scraped = scrapedOptions.get(field.selector);
+    if (scraped && scraped.length > 0) {
+      mergedField.options = scraped;
+      return mergedField as FieldSchema;
     }
-    if (Array.isArray(updated.radioOptions) && updated.radioOptions.length > 0) {
-      mergedField.radioOptions = updated.radioOptions;
+
+    // Fall back to re-scanned DOM schema (native selects)
+    const updated = refreshedBySelector.get(field.selector);
+    if (updated) {
+      if (Array.isArray((updated as any).options) && (updated as any).options.length > 0) {
+        mergedField.options = (updated as any).options;
+      }
+      if (Array.isArray(updated.radioOptions) && updated.radioOptions.length > 0) {
+        mergedField.radioOptions = updated.radioOptions;
+      }
     }
+
     return mergedField as FieldSchema;
   });
 
@@ -2405,9 +2476,12 @@ function handleExclusiveCheckbox(checkbox: HTMLInputElement): void {
 /**
  * Execute fill plan on form fields
  */
-async function executeFillPlan(plan: FillPlan): Promise<void> {
+async function executeFillPlan(plan: FillPlan): Promise<FillResult & { noOptionSelectors: string[] }> {
   autofillInProgress = true; // Set flag to prevent tracking our own fills as user edits
   
+  // Track autocomplete/select fields where no options were rendered yet (need post-fill hydration)
+  const noOptionSelectors: string[] = [];
+
   const result: FillResult = {
     kind: 'FILL_RESULT',
     requestId: plan.requestId,
@@ -3119,6 +3193,13 @@ async function executeFillPlan(plan: FillPlan): Promise<void> {
           console.log('[OA] Keyboard fallback completed, current value:', element.value || '<empty>');
         }
         
+        // If the option was not successfully clicked (either no options rendered, or no match found),
+        // mark for post-fill hydration + AI fallback so Ollama can pick the right option.
+        if (!optionClicked) {
+          console.log('[OA] Dropdown fill unresolved, queuing for post-fill AI fallback:', fieldSchema?.label, '| options found during fill:', realOptions.length);
+          noOptionSelectors.push(mapping.selector);
+        }
+
         element.blur();
         console.log('[OA] ✓ Autocomplete field done:', fieldSchema?.label);
         
@@ -3291,6 +3372,7 @@ async function executeFillPlan(plan: FillPlan): Promise<void> {
   }
   
   autofillInProgress = false; // Reset flag
+  return { ...result, noOptionSelectors };
 }
 
 /**

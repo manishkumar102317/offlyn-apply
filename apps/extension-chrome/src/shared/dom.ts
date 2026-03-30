@@ -600,56 +600,6 @@ function detectLikelyDropdown(field: HTMLInputElement | HTMLSelectElement | HTML
   return false;
 }
 
-/**
- * Get common options for known dropdown types
- */
-function getCommonDropdownOptions(label: string | null): string[] | undefined {
-  if (!label) return undefined;
-  
-  const labelLower = label.toLowerCase();
-  
-  // Yes/No questions
-  if (labelLower.includes('are you') || labelLower.includes('do you') || 
-      labelLower.includes('have you') || labelLower.includes('will you')) {
-    return ['Yes', 'No'];
-  }
-  
-  // Gender
-  if (labelLower.includes('gender') && !labelLower.includes('transgender')) {
-    return ['Male', 'Female', 'Non-binary', 'Prefer not to say', 'Other'];
-  }
-  
-  // Hispanic/Latino
-  if (labelLower.includes('hispanic') || labelLower.includes('latino')) {
-    return ['Yes', 'No', 'Prefer not to say'];
-  }
-  
-  // Veteran status
-  if (labelLower.includes('veteran')) {
-    return ['I am a veteran', 'I am not a veteran', 'Prefer not to say'];
-  }
-  
-  // Disability status
-  if (labelLower.includes('disability')) {
-    return ['Yes', 'No', 'Prefer not to say'];
-  }
-  
-  // Race (simplified - actual options vary)
-  if (labelLower.includes('race')) {
-    return [
-      'American Indian or Alaskan Native',
-      'Asian',
-      'Black or African American',
-      'Hispanic or Latino',
-      'Native Hawaiian or Other Pacific Islander',
-      'White',
-      'Two or More Races',
-      'Prefer not to say'
-    ];
-  }
-  
-  return undefined;
-}
 
 /**
  * Extract form schema from a form element or entire document
@@ -734,11 +684,12 @@ export function extractFormSchema(form: HTMLFormElement | Document): FieldSchema
     // Detect if this text input is actually a dropdown (common in ATS platforms)
     let actualType = field instanceof HTMLInputElement ? (field.type || null) : (field.tagName === 'SELECT' ? 'select' : 'textarea');
     let options: string[] | undefined = undefined;
-    
+
     if (detectLikelyDropdown(field, label)) {
       actualType = 'autocomplete'; // Mark as autocomplete (searchable dropdown)
-      options = getCommonDropdownOptions(label);
-      console.log('[OA] Upgraded field to autocomplete:', label, 'Options:', options?.length || 0);
+      // Options will be hydrated later by hydrateOptionsForFallback if needed.
+      // We no longer use hardcoded common options.
+      console.log('[OA] Upgraded field to autocomplete:', label, 'Options: (will be hydrated dynamically)');
     }
     
     // For actual select elements, extract options

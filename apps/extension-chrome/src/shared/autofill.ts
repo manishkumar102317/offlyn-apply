@@ -410,16 +410,6 @@ export async function applyAIOptionFallback(
     if (typeof currentValue === 'boolean') return true;
     // If value isn't one of available options, it's likely a weak/suspicious fill.
     if (!options.includes(v)) return true;
-    // Self-ID/consent/referral fields are high-risk for wrong deterministic fills; allow corrective fallback.
-    const q = (field.label || field.name || field.id || '').toLowerCase();
-    if (
-      q.includes('hispanic') || q.includes('latino') || q.includes('race') || q.includes('ethnic') ||
-      q.includes('veteran') || q.includes('disability') || q.includes('lgbt') || q.includes('orientation') ||
-      q.includes('referr') || q.includes('how did you hear')
-    ) {
-      return true;
-    }
-    return false;
   };
 
   for (const field of schema) {

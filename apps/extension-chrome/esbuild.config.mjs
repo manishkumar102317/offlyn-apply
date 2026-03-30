@@ -39,7 +39,7 @@ const buildOptions = {
   platform: 'browser',
   target: 'es2020',
   format: 'iife',
-  sourcemap: watch,
+  sourcemap: 'inline',
   minify: !watch,
   define: {
     'process.env.NODE_ENV': watch ? '"development"' : '"production"',
