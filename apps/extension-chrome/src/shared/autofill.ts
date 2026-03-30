@@ -492,13 +492,26 @@ export async function applyAIOptionFallback(
       const selected = parseSelectedOption(String(data.response || ''));
       if (!selected) continue;
 
-      const exactMatch = options.find(o => o === selected);
+      // Normalize helper: collapse whitespace, strip zero-width chars, lowercase
+      const normalize = (s: string) => s
+        .replace(/[\u200B-\u200D\uFEFF\u00A0]/g, ' ') // zero-width + non-breaking spaces → space
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+
+      const normalizedSelected = normalize(selected);
+      const exactMatch = options.find(o => o === selected)
+        ?? options.find(o => normalize(o) === normalizedSelected)
+        ?? options.find(o => normalize(o).includes(normalizedSelected) || normalizedSelected.includes(normalize(o)));
+
       if (!exactMatch) {
         diagnostics.skipped.non_exact_match++;
         console.warn('[Autofill/AI-Fallback] Rejected non-exact option from model:', {
           question,
           selected,
+          normalizedSelected,
           options: options.slice(0, 6),
+          normalizedOptions: options.slice(0, 6).map(normalize),
         });
         console.log('[Autofill/AI-Fallback] fallback_rejected_non_exact', {
           selector: field.selector,
